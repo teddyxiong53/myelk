@@ -1,4 +1,12 @@
+#include <assert.h>
+#include <math.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
 #include "elk.h"
+#include "mylog.h"
 
 typedef uint32_t jsoff_t;
 
@@ -127,7 +135,7 @@ enum {
     TOK_SHR_ASSIGN, // >>=
     TOK_ZSHR_ASSIGN,
     TOK_AND_ASSIGN, // &=
-    TOK_XOR_ASSIGN, // ^=\
+    TOK_XOR_ASSIGN, // ^=
     TOK_OR_ASSIGN, // |=
     TOK_COMMA, // ,
 
@@ -177,13 +185,58 @@ static jsval_t mkval(uint8_t type, uint64_t data)
         (data & 0xffffffffffffUL);
 
 }
+static bool is_nan(jsval_t v)
+{
+    return (v>>52)==0x7ffU;
+}
 
+static uint8_t vtype(jsval_t v)
+{
+    if (is_nan(v)) {
+        return (v>>48U)&15U;
+    } else {
+        return (uint8_t)T_NUM;
+    }
+}
+static size_t vdata(jsval_t v)
+{
+    return (size_t) (v & ~((jsval_t) 0x7fffUL << 48U));
+}
 
 static jsoff_t align32(jsoff_t v)
 {
     return (((v+3)>>2) << 2);
 }
 
+static bool is_err(jsval_t v)
+{
+    return vtype(v) == T_ERR;
+}
+
+static bool is_space(int c)
+{
+    return c==' ' || c=='\r' || c=='\n' || c=='\f' || c=='\v' || c=='\t';
+}
+static bool is_digit(int c)
+{
+    return c>='0' && c<='9';
+}
+static bool is_xdigit(int c)
+{
+    return is_digit(c) || (c>='a' && c<='f') || (c>='A'&&c<='F');
+}
+static bool is_alpha(int c)
+{
+    return (c>='a' && c<='z') || (c>='A' && c<='Z');
+}
+static bool is_ident_begin(int c)
+{
+    return c=='_' || c== '$' || is_alpha(c);
+}
+static bool is_ident_continue(int c)
+{
+    return c=='_' || c== '$' || is_alpha(c) || is_digit(c);
+}
 
 static size_t cpy(char *dst, size_t dstlen, const char *src, size_t srclen)
 {
@@ -252,6 +305,14 @@ static jsval_t mkentity(struct js* js, jsoff_t b, const char *buf, size_t len)
     if (ofs == ~0) {
         return js_mkerr(js, "oom");
     }
+    memcpy(&js->mem[ofs], &b, sizeof(b));
+    if (buf != NULL) {
+        memmove(&js->mem[ofs+sizeof(b)], buf, len);
+    }
+    if ((b&3) == T_STR) {
+        js->mem[ofs + sizeof(b) + len - 1] = 0;
+    }
+    return mkval(b&3, ofs);
 
 }
 /*
@@ -262,6 +323,37 @@ static jsval_t mkobj(struct js* js, jsoff_t parent)
 {
     return mkentity(js, 0 | T_OBJ, &parent, sizeof(parent));
 }
+
+jsval_t js_mkundef(void)
+{
+    return mkval(T_UNDEF, 0);
+}
+jsval_t js_mknull(void)
+{
+    return mkval(T_NULL, 0);
+}
+jsval_t js_mktrue(void)
+{
+    return mkval(T_BOOL, 1);
+}
+jsval_t js_mkfalse(void)
+{
+    return mkval(T_BOOL, 0);
+}
+jsval_t js_mknum(double value)
+{
+    return tov(value);
+}
+jsval_t js_mkobj(struct js *js)
+{
+    return mkobj(js, 0);
+}
+
+jsval_t js_mkfun(jsval_t (*fn)(struct js *, jsval_t *, int))
+{
+    return mkval(T_FUNC, (size_t)(void *)fn);
+}
+
 struct js * js_create(void *buf, size_t len)
 {
     struct js *js = NULL;
@@ -273,4 +365,300 @@ struct js * js_create(void *buf, size_t len)
     js->mem = (uint8_t *)(js+1);//先跳过js结构体大小，再把指针转成uint8_t的。
     js->size = (jsoff_t)(len - sizeof(*js));
     js->scope = mkobj(js, 0);
+    js->size = js->size/8U * 8U;// 8字节对齐
+    js->lwm = js->size;
+    js->gct = js->size/2;
+    return js;
+}
+/*
+    n表示当前的解析的位置
+    跳到下一个有效字符上。
+*/
+static jsoff_t skiptonext(const char *code, jsoff_t len, jsoff_t n)
+{
+    while (n < len) {
+        if (is_space(code[n])) {
+            n++;//跳过空白字符
+        } else if(n+1 < len && code[n]=='/' && code[n+1]=='/') {
+            // 是单行注释的情况
+            for (n+=2; n<len && code[n]!='\n';) {
+                n++;
+            }
+        } else if(n+3 < len && code[n]=='/' && code[n+1]=='*') {
+            //多行注释的情况
+            for (n+=4; n<len && (code[n-2]!='*' || (code[n-1]!='/')); ) {
+                n++;
+            }
+        } else {
+            break;//非空白，非注释
+        }
+    }
+    return n;
+}
+
+static bool streq(const char *buf, size_t len, const char *p, size_t n)
+{
+    return n == len && (memcmp(buf, p, len) == 0);
+}
+
+static uint8_t parsekeyword(const char *buf, size_t len)
+{
+    switch (buf[0]) {
+        case 'b':
+            if ((streq("break", 5, buf, len))) {
+                return TOK_BREAK;
+            }
+            break;
+        case 'c':
+            if (streq("class", 5, buf, len)) {
+                return TOK_CLASS;
+            }
+            if (streq("case", 4, buf, len)) {
+                return TOK_CASE;
+            }
+            if (streq("catch", 5, buf, len)) {
+                return TOK_CATCH;
+            }
+            if (streq("const", 5, buf, len)) {
+                return TOK_CONST;
+            }
+            if (streq("continue", 8, buf, len)) {
+                return TOK_CONTINUE;
+            }
+            
+            break;
+        case 'd':
+            if (streq("do", 2, buf, len)) {
+                return TOK_DO;
+            }
+            if (streq("default", 7, buf, len)) {
+                return TOK_DEFAULT;
+            }
+            break;
+        case 'e':
+            if (streq("else", 4, buf, len)) {
+                return TOK_ELSE;
+            }
+            break;
+        case 'f':
+            if (streq("for", 3, buf, len)) {
+                return TOK_FOR;
+            }
+            if (streq("function", 8, buf, len)) {
+                return TOK_FUNC;
+            }
+            if (streq("finally", 7, buf, len)) {
+                return TOK_FINALLY;
+            }
+            if (streq("false", 5, buf, len)) {
+                return TOK_FALSE;
+            }
+            break;
+        case 'i':
+            if (streq("if", 2, buf, len)) {
+                return TOK_IF;
+            }
+            if (streq("in", 2, buf, len)) {
+                return TOK_IN;
+            }
+            if (streq("instanceof", 10, buf, len)) {
+                return TOK_INSTANCEOF;
+            }
+            break;
+        case 'l':
+            if (streq("let", 3, buf, len)) {
+                return TOK_LET;
+            }
+
+            break;
+        case 'n':
+            if (streq("new", 3, buf, len)) {
+                return TOK_NEW;
+            }
+            if (streq("null", 4, buf, len)) {
+                return TOK_NULL;
+            }
+            break;
+        case 'r':
+            if (streq("return", 6, buf, len)) {
+                return TOK_RETURN;
+            }
+            break;
+        case 's':
+            if (streq("switch", 6, buf, len)) {
+                return TOK_SWITCH;
+            }
+            break;
+        case 't':
+            if (streq("try", 3, buf, len)) {
+                return TOK_TRY;
+            }
+            if (streq("this", 4, buf, len)) {
+                return TOK_THIS;
+            }
+            if (streq("throw", 5, buf, len)) {
+                return TOK_THROW;
+            }
+            if (streq("true", 4, buf, len)) {
+                return TOK_TRUE;
+            }
+            if (streq("typeof", 6, buf, len)) {
+                return TOK_TYPEOF;
+            }
+
+            break;
+        case 'u':
+            if (streq("undefined", 9, buf, len)) {
+                return TOK_UNDEF;
+            }
+            break;
+        case 'v':
+            if (streq("var", 3, buf, len)) {
+                return TOK_VAR;
+            }
+            if (streq("void", 4, buf, len)) {
+                return TOK_VOID;
+            }
+            break;
+        case 'w':
+            if (streq("while", 5, buf, len)) {
+                return TOK_WHILE;
+            }
+            if (streq("with", 4, buf, len)) {
+                return TOK_WITH;
+            }
+            break;
+        case 'y':
+            if (streq("yield", 5, buf, len)) {
+                return TOK_YIELD;
+            }
+            break;
+        default:
+            break;
+    }
+    return TOK_IDENTIFIER;
+}
+
+static uint8_t parseident(const char* buf, jsoff_t len, jsoff_t *tlen)
+{
+    if (is_ident_begin(buf[0])) {
+        while (*tlen < len && is_ident_continue(buf[*tlen])) {
+            return parsekeyword(buf, *tlen);
+        }
+    }
+    return TOK_ERR;
+}
+static uint8_t next(struct js *js)
+{
+    if (js->consumed == 0) {
+        return js->tok;//当前的tok还没有消费掉，那么直接返回当前的tok
+    }
+    js->consumed = 0;
+    js->tok = TOK_ERR;
+    js->toff = js->pos = skiptonext(js->code, js->clen, js->pos);
+    //当前到了有效字符上了。
+    js->tlen = 0;
+    const char *buf = js->code + js->toff;
+    //buf指向有效的字符位置
+    if (js->toff >= js->clen) {
+        //已经到末尾了
+        js->tok = TOK_EOF;
+        return js->tok;//会导致外面跳出循环
+    }
+#define TOK(T, LEN) {js->tok = T; js->tlen = (LEN); break;}
+#define LOOK(OFS, CH) js->toff+OFS < js->clen && buf[OFS]==CH
+    switch(buf[0]) {
+        case '?': TOK(TOK_Q, 1);
+        case ':': TOK(TOK_COLON, 1);
+        case '(': TOK(TOK_LPAREN, 1);
+        case ')': TOK(TOK_RPAREN, 1);
+        case '{': TOK(TOK_LBRACE, 1);
+        case '}': TOK(TOK_RBRACE, 1);
+        case ';': TOK(TOK_SEMICOLON, 1);
+        case ',': TOK(TOK_COMMA, 1);
+        case '!': if(LOOK(1,'=') && LOOK(2, '=')) TOK(TOK_NE, 3); TOK(TOK_NOT, 1);
+        case '.': TOK(TOK_DOT, 1);
+        case '~': TOK(TOK_TILDA, 1);
+        case '-': if (LOOK(1, '-')) TOK(TOK_POSTDEC, 2); if (LOOK(1,'=')) TOK(TOK_MINUS_ASSIGN, 2); TOK(TOK_MINUS, 1);
+        case '+': if (LOOK(1, '+')) TOK(TOK_POSTINC, 2); if (LOOK(1, '=')) TOK(TOK_PLUS_ASSIGN, 2); TOK(TOK_PLUS, 1);
+        case '*': if (LOOK(1, '*')) TOK(TOK_EXP, 2); if (LOOK(1, '=')) TOK(TOK_MUL_ASSIGN, 2); TOK(TOK_MUL, 1);
+        case '/': if (LOOK(1, '=')) TOK(TOK_DIV_ASSIGN, 2); TOK(TOK_DIV, 1);
+        case '%': if (LOOK(1, '=')) TOK(TOK_REM_ASSIGN, 2); TOK(TOK_REM, 1);
+        case '&': if (LOOK(1, '&')) TOK(TOK_LAND, 2); if (LOOK(1, '=')) TOK(TOK_AND_ASSIGN, 2); TOK(TOK_AND, 1);
+        case '|': if (LOOK(1, '|')) TOK(TOK_LOR, 2); if (LOOK(1, '=')) TOK(TOK_OR_ASSIGN, 2); TOK(TOK_OR, 1);
+        case '=': if (LOOK(1, '=') && LOOK(2, '=')) TOK(TOK_EQ, 3); TOK(TOK_ASSIGN, 1);
+        case '<': if (LOOK(1, '<') && LOOK(2, '=')) TOK(TOK_SHL_ASSIGN, 3); if (LOOK(1, '<')) TOK(TOK_SHL, 2); if (LOOK(1, '=')) TOK(TOK_LE, 2); TOK(TOK_LT, 1);
+        case '>': if (LOOK(1, '>') && LOOK(2, '=')) TOK(TOK_SHR_ASSIGN, 3); if (LOOK(1, '>')) TOK(TOK_SHR, 2); if (LOOK(1, '=')) TOK(TOK_GE, 2); TOK(TOK_GT, 1);
+        case '^': if (LOOK(1, '=')) TOK(TOK_XOR_ASSIGN, 2); TOK(TOK_XOR, 1);
+        case '"': 
+        case '\'':
+            js->tlen++;
+            while (js->toff + js->tlen < js->clen && buf[js->tlen] != buf[0]) {//buf[0]表示是引号，这里表示没有到字符串结束的位置
+                uint8_t increment = 1;
+                if (buf[js->tlen] == '\\') {
+                    //考虑使用转义的情况
+                    if (js->toff + js->tlen + 2 > js->clen) {
+                        break;
+                    }
+                    increment = 2;
+                    if (buf[js->tlen + 1] == 'x') {
+                        // \\x 的情况
+                        if (js->toff + js->tlen + 4 > js->clen) {
+                            break;
+                        }
+                        increment = 4;
+
+                    }
+                }
+                js->tlen += increment;
+            }
+            if (buf[0] == buf[js->tlen]) {
+                js->tok = TOK_STRING;
+                js->tlen ++;
+            }
+            break;
+        case '0':
+        case '1':
+        case '2':
+        case '3':
+        case '4':
+        case '5':
+        case '6':
+        case '7':
+        case '8':
+        case '9':
+            //数字的情况
+            {
+                char *end;
+                js->tval = tov(strtod(buf, &end));
+                TOK(TOK_NUMBER, (jsoff_t)(end - buf));//这里面有braek了
+            }
+        default://默认就是普通字母的情况。
+            js->tok = parseident(buf, js->clen - js->toff, &js->tlen);
+            break;
+
+    }
+}
+
+static jsval_t js_stmt(struct js *js)
+{
+    jsval_t res;
+    return res;
+}
+
+jsval_t js_eval(struct js *js, const char *buf, size_t len)
+{
+    jsval_t res = js_mkundef();
+    if (len == (size_t)~0U) {
+        len = strlen(buf);
+    }
+    js->consumed = 1;
+    js->tok = TOK_ERR;
+    js->code = buf;
+    js->clen = (jsoff_t)len;
+    js->pos = 0;
+    js->cstk = &res;//为什么指向这个？因为是C栈的第一个局部变量。
+    while (next(js) != TOK_EOF && !is_err(res)) {
+        res = js_stmt(js);
+    }
 }
