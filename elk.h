@@ -10,6 +10,6 @@ struct js;
 typedef uint64_t jsval_t;
 
 struct js *js_create(void *buf, size_t len);
-
+jsval_t js_mkerr(struct js *js, const char *xx, ...);
 
 #endif

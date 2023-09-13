@@ -202,7 +202,20 @@ static size_t vdata(jsval_t v)
 {
     return (size_t) (v & ~((jsval_t) 0x7fffUL << 48U));
 }
-
+static bool is_unary(uint8_t tok)
+{
+    return tok>=TOK_POSTINC && tok<=TOK_UMINUS;
+}
+static bool is_assign(uint8_t tok)
+{
+    return tok>=TOK_ASSIGN && tok<=TOK_OR_ASSIGN;
+}
+static jsval_t loadval(struct js* js, jsoff_t off)
+{
+    jsval_t v = 0;
+    memcpy(&v, &js->mem[off], sizeof(v));
+    return v;
+}
 static jsoff_t align32(jsoff_t v)
 {
     return (((v+3)>>2) << 2);
@@ -237,6 +250,33 @@ static bool is_ident_continue(int c)
 {
     return c=='_' || c== '$' || is_alpha(c) || is_digit(c);
 }
+/*
+    这里为什么是24bit？
+    有48bit可以用。
+    其中24bit用来表示长度，放在高位。
+*/
+static jsval_t mkcoderef(jsval_t off, jsoff_t len)
+{
+    return mkval(T_CODEREF, 
+        (off & 0xffffffU) | ((jsval_t)(len & 0xffffffU)<<24U)
+    );
+}
+static jsoff_t coderefoff(jsval_t v)
+{
+    return v&0xffffffU;
+}
+static jsoff_t codereflen(jsval_t v)
+{
+    return (v>>24U)&0xffffffU;
+}
+//希望下一个tok是什么，如果不是，报错。
+#define EXPECT(_tok, _e) do { \
+    if (next(js) != _tok) { \
+        _e; \
+        return js_mkerr(js, "parse error"); \
+    }; \
+    js->consumed = 1; \
+} while(0)
 
 static size_t cpy(char *dst, size_t dstlen, const char *src, size_t srclen)
 {
@@ -290,7 +330,7 @@ jsval_t js_mkerr(struct js *js, const char *xx, ...)
     va_end(ap);
     js->errmsg[sizeof(js->errmsg) - 1] = '\0';
     js->pos = js->clen;
-    js->tok = TOK_EOF;
+    js->tok = TOK_EOF;//为什么是给EOF，而不是给ERR呢？
     js->consumed = 0; //这3句表示出错就跳转到文件末尾。
     return mkval(T_ERR, 0);
 }
@@ -302,11 +342,13 @@ jsval_t js_mkerr(struct js *js, const char *xx, ...)
 static jsval_t mkentity(struct js* js, jsoff_t b, const char *buf, size_t len)
 {
     jsoff_t ofs = js_alloc(js, len + sizeof(b));//mkobj的时候，长度是8
-    if (ofs == ~0) {
+    if (ofs == (jsoff_t)~0) {
         return js_mkerr(js, "oom");
     }
     memcpy(&js->mem[ofs], &b, sizeof(b));
     if (buf != NULL) {
+        //memmove可以处理内存重叠的情况，比memcpy更加安全。
+        //当然，你明确知道内部不会重叠的时候，还是优先用memcpy
         memmove(&js->mem[ofs+sizeof(b)], buf, len);
     }
     if ((b&3) == T_STR) {
@@ -314,6 +356,29 @@ static jsval_t mkentity(struct js* js, jsoff_t b, const char *buf, size_t len)
     }
     return mkval(b&3, ofs);
 
+}
+
+static const char *typestr(uint8_t)
+{
+    const char *names[] = {
+        "object",
+        "prop",
+        "string",
+        "undefined",
+        "null",
+        "number",
+        "boolean",
+        "function",
+        "coderef",//这个具体指什么？
+        "cfunc",
+        "err",
+        "nan"
+    };
+    if (t < sizeof(names)/sizeof(names[0])) {
+        return names[t];
+    } else {
+        return "??";
+    }
 }
 /*
     parent表示要创建的obj的parent的entity所在的offset位置。
@@ -640,9 +705,273 @@ static uint8_t next(struct js *js)
     }
 }
 
+static jsval_t js_continue(struct js *js)
+{
+    if (js->flags & F_NOEXEC) {
+        // 
+    } else {
+        if (!(js->flags & F_LOOP)) {
+            return js_mkerr(js, "not in loop");
+        }
+        js->flags |= F_NOEXEC;
+    }
+    js->consumed = 1;
+    return js_mkundef();
+}
+
+static jsval_t resolveprop(struct js *js, jsval_t v)
+{
+    if (vtype(v) != T_PROP) {
+        return v;
+    }
+    return resolveprop(js, 
+        loadval(js, (jsoff_t)(vdata(v) + sizeof(jsoff_t)*2));
+    )
+}
+
+jsval_t js_mkstr(struct js *js, const void *ptr, size_t len)
+{
+    jsoff_t n = (jsoff_t)(len+1);
+    return mkentity(js, (jsoff_t)((n<<2) | T_STR), ptr, n);
+}
+
+/*
+    作用是：把mem里偏移到off位置的offset值取出来。
+*/
+static jsoff_t loadoff(struct js *js, jsoff_t off)
+{
+    jsoff_t v = 0;
+    assert(js->brk <= js->size);
+    memcpy(&v, &js->mem[off], sizeof(v));
+    return v;
+}
+
+/*
+    把off转成len
+*/
+static jsoff_t offtolen(jsoff_t off)
+{
+    return (off>>2) - 1;
+}
+/*
+    返回js 字符串的mem offset和长度
+*/
+static jsoff_t vstr(struct js* js, jsval_t value, jsoff_t *len)
+{
+    jsoff_t off = (jsoff_t)vdata(value);
+    if (len) {
+        *len = offtolen(loadoff(js, off));
+    }
+    return (jsoff_t)(off + sizeof(off));
+}
+
+static jsval_t upper(struct js *js, jsval_t scope)
+{
+    return mkval(T_OBJ, 
+        loadoff(js, (jsoff_t)(vdata(scope) + sizeof(jsoff_t)))
+    );
+}
+static void mkscope(struct js *js)
+{
+    assert((js->flags & F_NOEXEC) == 0);//那就要确保要exe
+    jsoff_t prev = (jsoff_t)vdata(js->scope);
+    js->scope = mkobj(js, prev);
+}
+
+static void delscope(struct js *js)
+{
+    js->scope = upper(js, js->scope);
+}
+static jsval_t call_js(struct js *js, const char *fn, jsoff_t fnlen)
+{
+    jsoff_t fnpos = 1;
+    mkscope(js);//创建函数调用scope
+    while (fnpos < fnlen) {
+        fnpos = skiptonext(fn, fnlen, fnpos);
+        if (fnpos < fnlen && fn[fnpos] == ')') {
+            break;
+        }
+        jsoff_t identlen = 0;
+        uint8_t tok = parseident(&fn[fnpos], fnlen-fnpos, &identlen);
+        if (tok != TOK_IDENTIFIER) {
+            break;
+        }
+        // 到这里，我们拿到了arg name，计算arg value
+        
+    }
+}
+static jsval_t do_call_op(struct js *js, jsval_t func, jsval_t args)
+{
+    if (vtype(args) != T_CODEREF) {
+        return js_mkerr(js, "bad call");
+    }
+    if (vtype(func) != T_FUNC && vtype(func) != T_CFUNC) {
+        return js_mkerr(js, "calling non-function");
+    }
+    const char *code = js->code;
+    jsoff_t clen = js->clen;
+    jsoff_t pos = js->pos;
+    js->code = &js->code[coderefoff(args)];
+    js->clen = codereflen(args);
+    js->pos = skiptonext(js->code, js->clen, 0);//调到第一个参数上
+    uint8_t tok = js->tok;
+    uint8_t flags = js->flags;//保存flags
+    jsoff_t nogc = js->nogc;
+    jsval_t res = js_mkundef();
+    if (vtype(func) == T_FUNC) {
+        jsoff_t fnlen = 0;
+        jsoff_t fnoff = vstr(js, func, &fnlen);//拿到函数名字
+        js->nogc = (jsoff_t)(fnoff - sizeof(jsoff_t));//标记这个内容不要被gc回收。
+        res = call_js(js, (const char *)(&js->mem[fnoff]), fnlen);
+    } else {
+        res = call_c(js, (jsval_t (*)(struct js*, jsval_t*, int))vdata(func));
+    }
+
+}
+static jsval_t do_op(strut js* js, uint8_t op, jsval_t lhs, jsval_t rhs)
+{
+    if (js->flags & F_NOEXEC) {
+        return 0;//返回0意义是什么？
+    }
+    jsval_t l = resolveprop(js, lhs);
+    jsval_t r = resolveprop(js, rhs);
+    // setlwm(js); TODO
+    if (is_err(l)) {
+        return l;
+    }
+    if (is_err(r)) {
+        return r;
+    }
+    if (is_assign(op) && vtype(lhs) != T_PROP) {
+        return js_mkerr(js, "bad lhs");
+    }
+    switch (op) {
+        // typeof是运算符号，所以可以不加括号的, typeof a这样。
+        case TOK_TYPEOF:
+            return js_mkstr(js, typestr(vtype(r)), strlen(typestr(vtype(r))));
+        case TOK_CALL:
+            return do_call_op(js, l, r);
+        
+    }
+}
+// 从右到左的二元操作
+#define RTL_BINOP(_f1, _f2, _cond)  \
+    jsval_t res = _f1(js);                 \
+    while (!(is_err(res)) && (_cond)) {    \
+        uint8_t op = js->tok;              \
+        js->consumed = 1;                  \
+        jsval_t rhs = _f2(js);             \
+        if (is_err(rhs)) {                 \
+            return rhs;                    \
+        }                                  \
+        res = do_op(js, op, res, rhs);     \
+    }                                      \
+    return res;
+static jsval_t js_break(struct js *js)
+{
+    if (js->flags & F_NOEXEC) {
+        //
+    } else {
+        if (!(js->flags & F_LOOP)) {
+            return js_mkerr(js, "not in loop");
+        }
+        js->flags |= F_BREAK | F_NOEXEC;
+    }
+    js->consumed = 1;
+    return js_mkundef();
+}
+//这是三元操作符 TODO
+static jsval_t js_tenary(struct js *js)
+{
+    jsval_t res = js_mkundef();
+    return res;
+}
+static jsval_t js_assignment(struct js *js)
+{
+    RTL_BINOP(js_ternary, js_assignment, 
+        (next(js) == TOK_ASSIGN || js->tok == TOK_PLUS_ASSIGN \
+            || js->tok == TOK_MINUS_ASSIGN \
+            || js->tok == TOK_MUL_ASSIGN \
+            || js->tok == TOK_DIV_ASSIGN \
+            || js->tok == TOK_REM_ASSIGN \
+            || js->tok == TOK_SHL_ASSIGN \
+            || js->tok == TOK_SHR_ASSIGN \
+            || js->tok == TOK_ZSHR_ASSIGN \
+            || js->tok == TOK_AND_ASSIGN \
+            || js->tok == TOK_OR_ASSIGN \
+            || js->tok == TOK_XOR_ASSIGN \
+        )
+    );
+}
+//表达式只有赋值表达式
+static jsval_t js_expr(strut js *js)
+{
+    return js_assignment(js);
+}
+// let a = 1;
+static jsval_t js_let(struct js *js)
+{
+    uint8_t exe = !(js->flags & F_NOEXEC);
+    js->consumed = 1;
+    for (;;) {
+        EXPECT(TOK_IDENTIFIER, );
+        js->consumed = 0;
+        jsoff_t noff = js->toff;//试图取出后面的identifier
+        jsoff_t nlen = js->tlen;//n是指next的意思
+        char *name = (char *)&js->code[noff];//拿到id的name
+        jsval_t v = js_mkundef();
+        js->consumed = 1;
+        //id后面就应该是一个赋值符号。
+        if (next(js) == TOK_ASSIGN) {
+            js->consumed = 1;
+            v = js_expr(js);
+            if (is_err(v)) {
+                return v;
+            }
+        }
+    }
+}
 static jsval_t js_stmt(struct js *js)
 {
     jsval_t res;
+    if (js->brk > js->gct) {
+        // js_gc(js);
+    }
+    switch(next(js)) {
+        case TOK_CASE:
+        case TOK_CATCH:
+        case TOK_CLASS:
+        case TOK_CONST:
+        case TOK_DEFAULT:
+        case TOK_DELETE:
+        case TOK_DO:
+        case TOK_FINALLY:
+        case TOK_IN:
+        case TOK_INSTANCEOF:
+        case TOK_NEW:
+        case TOK_SWITCH:
+        case TOK_THIS:
+        case TOK_THROW:
+        case TOK_TRY:
+        case TOK_VAR:
+        case TOK_VOID:
+        case TOK_WITH:
+        case TOK_WHILE:
+        case TOK_YIELD:
+            res = js_mkerr(js, "'%.*s not implemented", (int)js->tlen, js->code+js->toff);
+            break;
+        case TOK_CONTINUE:
+            res = js_continue(js);
+            break;
+        case TOK_BREAK:
+            res = js_break(js);
+            break;
+        case TOK_LET:
+            res = js_let(js);
+            break;
+        default:
+            break;
+    }
     return res;
 }
 
